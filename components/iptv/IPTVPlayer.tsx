@@ -21,6 +21,8 @@ const HLS_LIVE_CONFIG: Partial<Hls['config']> = {
   manifestLoadingMaxRetry: 3,
   levelLoadingTimeOut: 10000,
   fragLoadingTimeOut: 20000,
+  // Prefer H.264 (avc) over HEVC (hev/hvc) for maximum browser compatibility
+  preferManagedMediaSource: false,
 };
 
 const LOADING_TIMEOUT_MS = 30000;
@@ -52,6 +54,22 @@ function formatTime(seconds: number): string {
   return `${m}:${s.toString().padStart(2, '0')}`;
 }
 
+function getSeekRange(video: HTMLVideoElement): { start: number; end: number; duration: number } | null {
+  if (video.seekable.length > 0) {
+    const start = video.seekable.start(0);
+    const end = video.seekable.end(video.seekable.length - 1);
+    if (isFinite(start) && isFinite(end) && end > start) {
+      return { start, end, duration: end - start };
+    }
+  }
+
+  if (isFinite(video.duration) && video.duration > 0) {
+    return { start: 0, end: video.duration, duration: video.duration };
+  }
+
+  return null;
+}
+
 export function IPTVPlayer({ channel, onClose, channels, onChannelChange, channelsBySource, sources }: IPTVPlayerProps) {
   const videoRef = useRef<HTMLVideoElement>(null);
   const hlsRef = useRef<Hls | null>(null);
@@ -80,8 +98,6 @@ export function IPTVPlayer({ channel, onClose, channels, onChannelChange, channe
   const [showAllRoutes, setShowAllRoutes] = useState(false);
 
   // Multi-level sidebar state
-  const [activeSourceId, setActiveSourceId] = useState<string | null>(null);
-  const [activeGroup, setActiveGroup] = useState<string | null>(null);
   const [expandedSources, setExpandedSources] = useState<Set<string>>(new Set());
   const [expandedGroups, setExpandedGroups] = useState<Set<string>>(new Set());
 
@@ -198,6 +214,11 @@ export function IPTVPlayer({ channel, onClose, channels, onChannelChange, channe
     video.load();
 
     const proxiedUrl = getProxiedUrl(url, channel.httpUserAgent, channel.httpReferrer);
+    const hasCustomHeaders = !!(channel.httpUserAgent || channel.httpReferrer);
+    // When custom headers are needed, skip direct attempt (browsers cannot set
+    // User-Agent on XHR/fetch). Always go through our proxy which can forward
+    // the headers server-side. This fixes audio-only issues on CCTV and similar.
+    const initialUrl = hasCustomHeaders ? proxiedUrl : url;
 
     // Global loading timeout
     let loadingResolved = false;
@@ -275,7 +296,10 @@ export function IPTVPlayer({ channel, onClose, channels, onChannelChange, channe
         hlsRef.current = hlsProxy;
         hlsProxy.loadSource(proxiedUrl);
         hlsProxy.attachMedia(video);
-        hlsProxy.on(Hls.Events.MANIFEST_PARSED, () => {
+
+        // Filter HEVC levels for proxy attempt too
+        hlsProxy.on(Hls.Events.MANIFEST_PARSED, (_, data) => {
+          filterHEVCLevels(hlsProxy);
           markLoaded();
           video.play().catch(() => {});
         });
@@ -292,10 +316,30 @@ export function IPTVPlayer({ channel, onClose, channels, onChannelChange, channe
         });
       };
 
-      // First try direct URL with HLS.js
-      hls.loadSource(url);
+      // Helper: Filter out HEVC levels that browser may not support (fixes audio-only issue)
+      const filterHEVCLevels = (hlsInstance: Hls) => {
+        if (!hlsInstance.levels || hlsInstance.levels.length <= 1) return;
+        const h264Levels = hlsInstance.levels
+          .map((level, index) => ({ level, index }))
+          .filter(({ level }) => {
+            const codec = level.videoCodec?.toLowerCase() || '';
+            // Keep levels without HEVC codec (H.264 or unknown)
+            return !codec.includes('hev') && !codec.includes('h265') && !codec.includes('hvc');
+          });
+        // If we have H.264 levels, restrict to those
+        if (h264Levels.length > 0 && h264Levels.length < hlsInstance.levels.length) {
+          console.info('[IPTV] Filtering HEVC levels, using H.264 only for compatibility');
+          // Set level to first H.264 level
+          hlsInstance.currentLevel = h264Levels[0].index;
+        }
+      };
+
+      // First try initial URL (direct or proxied based on custom headers)
+      hls.loadSource(initialUrl);
       hls.attachMedia(video);
-      hls.on(Hls.Events.MANIFEST_PARSED, () => {
+      hls.on(Hls.Events.MANIFEST_PARSED, (_, data) => {
+        // Filter HEVC levels to prevent audio-only playback
+        filterHEVCLevels(hls);
         markLoaded();
         video.play().catch(() => {});
       });
@@ -312,12 +356,17 @@ export function IPTVPlayer({ channel, onClose, channels, onChannelChange, channe
       });
     } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
       // Native HLS (Safari/iOS)
-      video.src = url;
+      video.src = initialUrl;
       video.addEventListener('canplay', () => {
         markLoaded();
         video.play().catch(() => {});
       }, { once: true });
       video.addEventListener('error', () => {
+        // If direct failed, try proxy; if already proxied, fail
+        if (initialUrl === proxiedUrl) {
+          markError('播放错误');
+          return;
+        }
         video.src = proxiedUrl;
         video.addEventListener('canplay', () => {
           markLoaded();
@@ -329,12 +378,16 @@ export function IPTVPlayer({ channel, onClose, channels, onChannelChange, channe
       }, { once: true });
     } else {
       // Direct video fallback
-      video.src = url;
+      video.src = initialUrl;
       video.addEventListener('canplay', () => {
         markLoaded();
         video.play().catch(() => {});
       }, { once: true });
       video.addEventListener('error', () => {
+        if (initialUrl === proxiedUrl) {
+          markError('播放错误，请尝试其他频道');
+          return;
+        }
         video.src = proxiedUrl;
         video.addEventListener('canplay', () => {
           markLoaded();
@@ -395,11 +448,23 @@ export function IPTVPlayer({ channel, onClose, channels, onChannelChange, channe
     if (isLive) return;
     const video = videoRef.current;
     const bar = progressRef.current;
-    if (!video || !duration || !bar) return;
+    if (!video || !bar) return;
+    const seekRange = getSeekRange(video);
+    if (!seekRange) return;
     const rect = bar.getBoundingClientRect();
     const ratio = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
-    video.currentTime = ratio * duration;
+    video.currentTime = seekRange.start + ratio * seekRange.duration;
   };
+
+  const progressPercent = useMemo(() => {
+    const video = videoRef.current;
+    const seekRange = video ? getSeekRange(video) : null;
+    if (seekRange) {
+      return Math.max(0, Math.min(100, ((currentTime - seekRange.start) / seekRange.duration) * 100));
+    }
+    if (!duration) return 0;
+    return Math.max(0, Math.min(100, (currentTime / duration) * 100));
+  }, [currentTime, duration]);
 
   const toggleFullscreen = async () => {
     if (!containerRef.current) return;
@@ -750,7 +815,7 @@ export function IPTVPlayer({ channel, onClose, channels, onChannelChange, channe
               >
                 <div
                   className="h-full bg-[var(--accent-color)] rounded-full relative pointer-events-none"
-                  style={{ width: `${(currentTime / duration) * 100}%` }}
+                  style={{ width: `${progressPercent}%` }}
                 >
                   <div className="absolute right-0 top-1/2 -translate-y-1/2 w-3 h-3 bg-white rounded-full opacity-0 group-hover:opacity-100 transition-opacity" />
                 </div>
