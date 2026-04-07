@@ -20,7 +20,7 @@ class MainActivity : ComponentActivity() {
 
     companion object {
         private const val PREFS_NAME = "kvideo_tv_settings"
-        private const val PREF_SERVER_URL = "server_url"
+        private const val PREF_SERVER_URL = "https://ktv.joan.ccwu.cc/"
     }
 
     private lateinit var webView: WebView
